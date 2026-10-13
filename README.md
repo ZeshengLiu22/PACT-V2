@@ -1,9 +1,53 @@
 # Full-Field Storm Surge Emulator
 
-A minimal PyTorch training pipeline over the existing model-ready monthly sample
-lists. `smoke` is a trainable linear pipeline check, not a scientific emulator.
+A PyTorch training framework over the existing model-ready monthly sample
+lists, organized into data, model, and training modules. `smoke` is a trainable
+linear pipeline check, not a scientific emulator.
 The reserved `base`, `igarss27`, `full_v1`, and `full_v2` architectures are not
 implemented.
+
+## Repository structure
+
+```text
+train.py                          # CLI and experiment orchestration
+configs/ncep.yaml                 # Existing experiment configuration
+emulator/
+    __init__.py
+    data/
+        __init__.py
+        dataset.py                # FullFieldDataset: mapped months and global indexing
+        mesh.py                   # Shared mesh loading and schema validation
+        splits.py                 # Deterministic simulation-year partitions
+        normalization.py          # TRAIN-only monthly FP64 moments and statistics
+        loaders.py                # Training/evaluation loaders and samplers
+    models/
+        __init__.py
+        smoke.py                  # Existing linear SmokeModel
+    training/
+        __init__.py
+        config.py                 # YAML loading and supported-option validation
+        engine.py                 # Training/evaluation execution and accumulation
+        losses.py                 # Spatial weights and physical error totals
+        metrics.py                # Complete-population overall RMSE/MAE
+        checkpoints.py            # Saving, resume validation, and state restoration
+        runtime.py                # Device/DDP setup, timing, and memory monitoring
+        smoke.py                  # Loading benchmark and shuffle diagnostics
+tests/
+    __init__.py
+    fixtures.py                   # Shared temporary monthly fixtures
+    test_dataset.py               # Splits, indexing, history, mesh/node identity
+    test_numerics.py              # Normalization, weights, loss, metrics, gradients
+    test_training.py              # Forward/backward and checkpoint/resume
+README.md
+```
+
+Package imports are explicit, for example
+`from emulator.data.dataset import FullFieldDataset`. `train.py` coordinates the
+experiment; numerical code and model definitions live in the package. The
+structure follows the responsibility boundaries of
+[StormSurge](https://github.com/ZeshengLiu22/StormSurge), retaining PACT-V2's
+full-field tensor contracts and loading strategy. No registry, manager, callback
+framework, or future-model placeholder is required.
 
 ## Run
 
@@ -18,24 +62,29 @@ cd /glade/u/home/zel/scratch/PACT-V2
 ```
 
 Smoke mode keeps the YAML defaults, fits statistics on **all TRAIN samples**,
-benchmarks six consecutive globally shuffled batches, trains four real batches,
-and evaluates a reproducible subset of up to 128 samples from each actual
-held-out split. It saves and reloads the validation-selected checkpoint and
-verifies its validation metrics. Smoke metrics are limited-run integration
-results. Each smoke run gets its own timestamped directory under `results/`.
+benchmarks up to six consecutive globally shuffled batches, trains up to four
+real batches, and evaluates a reproducible subset of at most two batches per
+actual held-out split (128 samples with the default batch size of 64). It saves
+and reloads the validation-selected checkpoint and verifies its validation
+metrics. Smoke metrics are limited-run integration results. Each fresh smoke
+run gets its own timestamped directory under the configured
+`experiment.output_dir` (`results/` by default).
 
 ```bash
-# Set training.resume_from in the run's resolved_config.yaml to its last.pt.
-# Continue a smoke run for one additional limited training pass.
-python train.py --config results/RUN/resolved_config.yaml --smoke-test
+# Copy the resolved config and set training.resume_from to the run's last.pt.
+cp results/RUN/resolved_config.yaml /tmp/pact-resume.yaml
+# After editing that YAML, continue smoke mode for one limited training pass.
+python train.py --config /tmp/pact-resume.yaml --smoke-test
 # Full configured training and complete VAL/TEST evaluation.
 python train.py --config configs/ncep.yaml
 # Ordinary DDP, with the number of processes chosen for the allocated resources.
 torchrun --standalone --nproc_per_node=2 train.py --config configs/ncep.yaml
 ```
 
-Resume restores model, Adam, scheduler, TRAIN normalization, and epoch state.
-Keep `best_overall.pt` alongside `last.pt`. Resume checks the data, split, mesh
+Resume uses the YAML `training.resume_from` key; there is no resume CLI flag.
+It writes back to the checkpoint directory and restores model, Adam, scheduler,
+TRAIN normalization, and epoch state. Keep `best_overall.pt` alongside `last.pt`.
+Resume checks the data, split, mesh
 identity, loss, and training configuration. This is basic epoch-boundary resume;
 it does not promise bitwise continuation of random sampling after interruption.
 BF16 autocast runs only on supported CUDA devices. CPU execution reports AMP
@@ -51,12 +100,14 @@ sorted years, optional Python seeded shuffle, Python `round`, and the original
 small-dataset boundaries. `future_only` means strictly greater than the threshold.
 A training run requires a real VAL split. Missing TEST is reported explicitly.
 
-`dataset.py` maps each monthly `.pt` list once and builds a global sample index.
-The configured Linux DataLoader workers inherit these mappings. PyTorch's built-in
+`emulator/data/dataset.py` maps each monthly `.pt` list once and builds a global
+sample index. The configured Linux DataLoader workers inherit these mappings.
+PyTorch's built-in
 `calculate_storage_offsets=True` avoids unnecessary random archive-header reads
-on the shared filesystem; a real monthly-file benchmark reduced loading from
-24.038 s to 0.156 s with identical storage offsets/shapes/dtypes. The OS loads
-and shares file-backed pages on demand; this avoids both full preloading and
+on the shared filesystem. Before the refactor, a real monthly-file benchmark
+reduced loading from 24.038 s to 0.156 s with identical storage
+offsets/shapes/dtypes. The OS loads and shares file-backed pages on demand;
+this avoids both full preloading and
 repeated deserialization of random monthly files. The observed NCEP archive is
 about 231 GiB. Initialization checks sample shapes and canonical node identity
 against metadata, then discards full metadata. It retains only timestamps and
@@ -68,8 +119,8 @@ Normalization eagerly loads and reduces one month per worker, using the
 configured DataLoader worker count (at least one), then releases that month.
 Only small FP64 moments are combined, in file order; the whole TRAIN population
 is never retained in RAM. Eager reads avoid the measured slow page-fault I/O
-of the initial sequential mapped scan (a one-month probe peaked at 1.69 GiB).
-Stored non-WW surge NaNs and all four state labels remain unchanged. Models
+of the initial sequential mapped scan (the pre-refactor one-month probe peaked
+at 1.69 GiB). Stored non-WW surge NaNs and all four state labels remain unchanged. Models
 receive forcing/tide inputs and the shared mesh; target surge/state are never
 model inputs. Float64 tide values and times are preserved.
 
@@ -97,6 +148,12 @@ apportioned instead of counted once per worker). Sampling can miss brief peaks.
 CUDA peak allocated memory is null when CUDA is unavailable. Timings reflect
 filesystem caching and concurrent HPC activity, not guaranteed throughput.
 
+## Known limitations
+
+`smoke` uses a linear layer over spatially averaged latest forcing and broadcasts
+its six outputs to every mesh node. It is an integration model. Reserved
+`base`, `igarss27`, `full_v1`, and `full_v2` names fail explicitly.
+
 Tail and GT-aligned Episode Peak losses await the Episode Audit. Nonzero weights
 fail clearly. The nine canonical extreme/episode metrics, exceedance checkpoint
 selection, real model architectures, and cross-dataset inference remain pending.
@@ -104,7 +161,31 @@ The only reported scientific metrics are `all_rmse` and `all_mae`, following the
 [reference metrics](https://github.com/ZeshengLiu22/StormSurge/blob/main/docs/METRICS.md).
 
 
-## Verified NCEP run (2026-10-13)
+## Refactor verification (2026-10-13)
+
+The pre-refactor baseline passed all nine unit tests. The reorganized suite
+passes those same tests plus one checkpoint schema/resume-guard regression test
+(10 total). All package imports and the unchanged CLI help were checked.
+
+Small deterministic CPU smoke, resume, and two-process Gloo DDP runs matched the
+saved pre-refactor implementation: model, Adam, scheduler, and normalization
+states were bitwise identical; metric logs, checkpoint fields, and artifact
+schemas matched exactly. Time and memory measurements were excluded from value
+comparisons. DDP included uneven held-out partitions and partial gradient
+accumulation windows. A two-worker persistent-loader smoke comparison also
+matched, and the refactored CLI resumed a checkpoint written by the old code.
+All new validation outputs were written outside the repository's `results/`.
+
+The full NCEP normalization benchmark and GPU/BF16 execution were not repeated.
+The measurements below are historical evidence from the original pipeline.
+
+## Historical NCEP verification (2026-10-13, before this refactor)
+
+All real NCEP checks and measurements below were completed by the preceding
+implementation. They were preserved as evidence and were **not rerun or
+remeasured for this structural refactor**. Refactor validation uses focused
+unit tests and small CPU fixtures; the expensive full TRAIN normalization is
+not required to validate module moves. GPU/BF16 execution remains unvalidated.
 
 The existing `dataset/NCEP` symlink points to
 `/glade/u/home/zel/scratch/FullField/Processed_Samples/NCEP`. Its 177 monthly
@@ -128,9 +209,9 @@ Observed tensors:
 | edge_index / edge_attr | [2,907014] / [907014,3] | int64 / float64 |
 | face / boundary_node_index | [3,293923] / [141] | int64 |
 
-Nine focused tests, two-process CPU DDP, real-data smoke, and real-data YAML
-resume all passed. Checks cover indexing, simulation-year isolation, global
-shuffling, history slices, separate mesh, WW normalization, spatial weighting,
+Before the refactor, nine focused tests, two-process CPU DDP, real-data smoke,
+and real-data YAML resume all passed. Checks cover indexing, simulation-year
+isolation, global shuffling, history slices, separate mesh, WW normalization, spatial weighting,
 NaN-safe physical loss, accumulated gradients, complete-population metric
 reduction, forward/backward, validation, checkpoint reload, and resume.
 The first real batch contained samples from 22 years and 49 monthly files;
@@ -175,9 +256,3 @@ and [verification evidence](results/verification/). The run also contains
 `resolved_config.yaml`, `normalization.pt`, `last.pt`, `best_overall.pt`, and
 `training_metrics.jsonl`. Verification retains the stopped I/O experiments as
 incomplete attempts, not successful smoke runs.
-
-Complexity review retained two implementation files and two classes
-(`FullFieldDataset`, `SmokeModel`). Helpers perform distinct numerical/runtime
-operations; the month reducer is justified by the measured I/O bottleneck.
-There are no registries, base classes, managers, callback systems, model stubs,
-or extra architecture files.
