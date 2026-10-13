@@ -1,0 +1,83 @@
+experiment:
+  name: NCEP_IGARSS27
+  seed: 42
+  output_dir: /glade/u/home/zel/scratch/PACT-V2/results
+
+data:
+  root: /glade/u/home/zel/scratch/PACT-V2/dataset
+  source: NCEP
+  history_hours: 48  # 0, 6, 12, ..., 48
+
+split:
+  train_ratio: 0.6
+  val_ratio: 0.2
+  shuffle_years: false
+  future_only: false
+  future_year_threshold: 2030
+
+normalization:
+  forcing: mean_std
+  target: mean_std
+
+spatial_weighting:
+  mode: uniform
+  weights_file: null
+
+model:
+  name: igarss27
+  temporal_encoder: gru  # gru | lstm | temporal_cnn | tcn
+  temporal_hidden_dim: 64  # Temporal feature width
+  spatial_encoder: unet
+  unet_channels: [64, 128, 256]
+  scales: [0, 1, 2]  # [0] | [0,1] | [0,1,2]; shared U-Net
+  projector: bilinear
+  projected_dim: 32  # Per-scale mesh feature width
+  mesh_encoder: gnn
+  mesh_hidden_dim: 64  # Static mesh embedding width
+  mesh_encoder_layers: 2
+  fusion: concat  # concat | adaptive
+  decoder: mlp  # mlp | gnn
+  decoder_hidden_dim: 128  # Mesh decoder width
+  decoder_gnn_layers: 2  # Used only by the gnn decoder
+
+loss:
+  global_mse: true
+  # Tail and Episode Peak definitions await the Episode Audit.
+  tail:
+    percentile: 95
+    weight: 0.0
+  episode_peak:
+    weight: 0.0
+
+training:
+  epochs: 300
+  batch_size: 64
+  grad_accum_steps: 1
+  optimizer: adam
+  lr: 0.001
+  weight_decay: 0.00001
+  scheduler: cosine
+  warmup_epochs: 5
+  warmup_start_factor: 0.1
+  min_lr: 0.000001
+  max_grad_norm: 0.0
+  amp: true
+  amp_dtype: bf16
+  tf32: true
+  deterministic: false
+  device: auto
+  distributed: auto
+  resume_from: null
+
+dataloader:
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+evaluation:
+  checkpoint_selection: overall
+  save_overall_checkpoint: true
+  val_every_epochs: 1
+  test_at_end: true
+  save_predictions: false
