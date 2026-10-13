@@ -9,7 +9,9 @@ implemented.
 ## Repository structure
 
 ```text
-train.py                          # CLI and experiment orchestration
+scripts/
+    __init__.py
+    train.py                      # CLI and experiment orchestration
 configs/ncep.yaml                 # Existing experiment configuration
 emulator/
     __init__.py
@@ -42,14 +44,18 @@ README.md
 ```
 
 Package imports are explicit, for example
-`from emulator.data.dataset import FullFieldDataset`. `train.py` coordinates the
-experiment; numerical code and model definitions live in the package. The
+`from emulator.data.dataset import FullFieldDataset`. `scripts/train.py`
+coordinates the experiment; numerical code and model definitions live in the
+package. The
 structure follows the responsibility boundaries of
 [StormSurge](https://github.com/ZeshengLiu22/StormSurge), retaining PACT-V2's
 full-field tensor contracts and loading strategy. No registry, manager, callback
 framework, or future-model placeholder is required.
 
 ## Run
+
+Run commands from the repository root so Python resolves both the `scripts` and
+`emulator` packages. The canonical entry point is `python -m scripts.train`.
 
 Dependencies: PyTorch >= 2.7 and PyYAML. The verified local environment is
 `/glade/work/zel/conda-envs/pact-casper-cu126/bin/python` (PyTorch 2.7.1+cu126,
@@ -58,7 +64,7 @@ PyYAML 6.0.3). The default shell Python does not have PyTorch.
 ```bash
 cd /glade/u/home/zel/scratch/PACT-V2
 /glade/work/zel/conda-envs/pact-casper-cu126/bin/python -m unittest discover -s tests -v
-/glade/work/zel/conda-envs/pact-casper-cu126/bin/python train.py --config configs/ncep.yaml --smoke-test
+/glade/work/zel/conda-envs/pact-casper-cu126/bin/python -m scripts.train --config configs/ncep.yaml --smoke-test
 ```
 
 Smoke mode keeps the YAML defaults, fits statistics on **all TRAIN samples**,
@@ -74,11 +80,12 @@ run gets its own timestamped directory under the configured
 # Copy the resolved config and set training.resume_from to the run's last.pt.
 cp results/RUN/resolved_config.yaml /tmp/pact-resume.yaml
 # After editing that YAML, continue smoke mode for one limited training pass.
-python train.py --config /tmp/pact-resume.yaml --smoke-test
+python -m scripts.train --config /tmp/pact-resume.yaml --smoke-test
 # Full configured training and complete VAL/TEST evaluation.
-python train.py --config configs/ncep.yaml
+python -m scripts.train --config configs/ncep.yaml
 # Ordinary DDP, with the number of processes chosen for the allocated resources.
-torchrun --standalone --nproc_per_node=2 train.py --config configs/ncep.yaml
+torchrun --standalone --nproc_per_node=2 \
+    --module scripts.train --config configs/ncep.yaml
 ```
 
 Resume uses the YAML `training.resume_from` key; there is no resume CLI flag.

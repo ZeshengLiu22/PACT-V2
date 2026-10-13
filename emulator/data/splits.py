@@ -5,19 +5,32 @@ import random
 
 
 def split_years(years, config, seed=42):
-    """StormSurge graph_store.py semantics, using simulation-directory years."""
+    """Return train/val/test simulation-year lists with the existing split rules.
+
+    Entire simulation directories stay together, even when monthly files span
+    calendar years, preventing samples from one simulation leaking into another
+    split. Optional shuffling uses a local seeded RNG.
+    """
     train_ratio, val_ratio = config["train_ratio"], config["val_ratio"]
     ratio_sum = train_ratio + val_ratio
     no_test = math.isclose(ratio_sum, 1.0)
-    if (not math.isfinite(ratio_sum) or train_ratio <= 0 or val_ratio <= 0
-            or (ratio_sum > 1.0 and not no_test)):
+    if (
+        not math.isfinite(ratio_sum)
+        or train_ratio <= 0
+        or val_ratio <= 0
+        or (ratio_sum > 1.0 and not no_test)
+    ):
         raise ValueError("Require positive train/val ratios with sum <= 1")
-    years = sorted(y for y in years if not config["future_only"]
-                   or y > config["future_year_threshold"])
+
+    years = sorted(
+        y for y in years
+        if not config["future_only"] or y > config["future_year_threshold"]
+    )
     if not years:
         raise ValueError("No simulation years remain after filtering")
     if config["shuffle_years"]:
         random.Random(seed).shuffle(years)
+
     count = len(years)
     if no_test:
         if count < 2:
@@ -25,12 +38,16 @@ def split_years(years, config, seed=42):
         ntrain = min(count - 1, max(1, round(train_ratio * count)))
         nval = count - ntrain
     else:
+        # Preserve the established rounding and small-dataset allocation rules.
         ntrain = max(1, round(train_ratio * count))
         nval = max(1, round(val_ratio * count))
         if count <= 2:
             ntrain, nval = 1, count - 1
         elif ntrain + nval >= count:
             ntrain, nval = count - 2, 1
-    return {"train": years[:ntrain], "val": years[ntrain:ntrain + nval],
-            "test": years[ntrain + nval:]}
 
+    return {
+        "train": years[:ntrain],
+        "val": years[ntrain:ntrain + nval],
+        "test": years[ntrain + nval:],
+    }

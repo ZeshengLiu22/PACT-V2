@@ -14,42 +14,88 @@ from tests.fixtures import SyntheticDatasetTestCase
 
 
 class NumericsTests(SyntheticDatasetTestCase):
+    """Check statistics, masks, and reductions against explicit numerical references."""
+
     def test_train_ww_only_normalization_and_selected_history(self):
+        """Use TRAIN history and WW targets with reproducible population moments."""
         train = FullFieldDataset(self.directory, [2000], self.mesh, history_hours=24)
         validation = FullFieldDataset(self.directory, [2001], self.mesh, history_hours=24)
+
         stats = compute_normalization(train)
         parallel_stats = compute_normalization(train, num_workers=2)
         for key in ("forcing_mean", "forcing_std", "surge_mean", "surge_std"):
             torch.testing.assert_close(stats[key], parallel_stats[key], rtol=0, atol=0)
-        forcing = torch.cat([sample["forcing"].double().movedim(1, 0).reshape(5, -1)
-                             for sample in train], dim=1)
+
+        # An eager FP64 reference checks the selected history and excludes
+        # non-WW NaNs without relying on the monthly moment implementation.
+        forcing = torch.cat(
+            [
+                sample["forcing"].double().movedim(1, 0).reshape(5, -1)
+                for sample in train
+            ],
+            dim=1,
+        )
         surge = torch.cat([sample["surge"][sample["state"] == 0].double() for sample in train])
-        torch.testing.assert_close(torch.as_tensor(stats["forcing_mean"]).double(), forcing.mean(1), rtol=1e-6, atol=1e-6)
-        torch.testing.assert_close(torch.as_tensor(stats["forcing_std"]).double(), forcing.std(1, unbiased=False), rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(
+            torch.as_tensor(stats["forcing_mean"]).double(),
+            forcing.mean(1),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            torch.as_tensor(stats["forcing_std"]).double(),
+            forcing.std(1, unbiased=False),
+            rtol=1e-6,
+            atol=1e-6,
+        )
         self.assertAlmostEqual(float(stats["surge_mean"]), float(surge.mean()), places=5)
-        self.assertAlmostEqual(float(stats["surge_std"]), float(surge.std(unbiased=False)), places=5)
-        self.assertLess(float(stats["forcing_mean"][0]), float(validation[0]["forcing"][:, 0].mean()))
-        self.assertTrue(all(torch.isfinite(torch.as_tensor(stats[key])).all()
-                            for key in ("forcing_mean", "forcing_std", "surge_mean", "surge_std")))
+        self.assertAlmostEqual(
+            float(stats["surge_std"]), float(surge.std(unbiased=False)), places=5
+        )
+        self.assertLess(
+            float(stats["forcing_mean"][0]), float(validation[0]["forcing"][:, 0].mean())
+        )
+        self.assertTrue(all(
+            torch.isfinite(torch.as_tensor(stats[key])).all()
+            for key in ("forcing_mean", "forcing_std", "surge_mean", "surge_std")
+        ))
 
     def test_spatial_weights_and_invalid_node_order(self):
+        """Preserve weight precision and reject values misaligned with the mesh."""
         uniform = load_spatial_weights(self.mesh, {"mode": "uniform", "weights_file": None})
         torch.testing.assert_close(uniform, torch.ones(3))
+
         path = self.root / "weights.pt"
         payload = {"node_id": self.mesh["node_id"], "weights": torch.tensor([0.0, 2.0, 4.0])}
         torch.save(payload, path)
-        torch.testing.assert_close(load_spatial_weights(self.mesh, {"mode": "uniform", "weights_file": str(path)}),
-                                   torch.tensor([0.0, 1.0, 1.0]))
-        torch.testing.assert_close(load_spatial_weights(self.mesh, {"mode": "weighted", "weights_file": str(path)}),
-                                   payload["weights"])
+
+        # Uniform mode retains zero-weight exclusions but discards magnitudes.
+        torch.testing.assert_close(
+            load_spatial_weights(self.mesh, {"mode": "uniform", "weights_file": str(path)}),
+            torch.tensor([0.0, 1.0, 1.0]),
+        )
+        torch.testing.assert_close(
+            load_spatial_weights(self.mesh, {"mode": "weighted", "weights_file": str(path)}),
+            payload["weights"],
+        )
         torch.save({**payload, "weights": payload["weights"].double()}, path)
-        self.assertEqual(load_spatial_weights(self.mesh, {"mode": "weighted", "weights_file": str(path)}).dtype, torch.float64)
-        for invalid in ({**payload, "node_id": self.mesh["node_id"].flip(0)},
-                        {**payload, "weights": torch.tensor([0.0, -1.0, 2.0])},
-                        {**payload, "weights": torch.tensor([0.0, float("nan"), 2.0])}):
+        self.assertEqual(
+            load_spatial_weights(
+                self.mesh, {"mode": "weighted", "weights_file": str(path)}
+            ).dtype,
+            torch.float64,
+        )
+
+        for invalid in (
+            {**payload, "node_id": self.mesh["node_id"].flip(0)},
+            {**payload, "weights": torch.tensor([0.0, -1.0, 2.0])},
+            {**payload, "weights": torch.tensor([0.0, float("nan"), 2.0])},
+        ):
             torch.save(invalid, path)
             with self.assertRaises(ValueError):
                 load_spatial_weights(self.mesh, {"mode": "weighted", "weights_file": str(path)})
+
+        # The same canonical node order must also hold for sample metadata.
         meta_path = self.directory / "2000" / "meta_200011.pt"
         metadata = torch.load(meta_path, weights_only=True)
         metadata[0]["node_id"] = self.mesh["node_id"].flip(0)
@@ -58,15 +104,24 @@ class NumericsTests(SyntheticDatasetTestCase):
             FullFieldDataset(self.directory, [2000], self.mesh)
 
     def test_nan_safe_weighted_physical_mse_and_zero_exclusion(self):
+        """Excluded nodes and non-WW NaNs contribute neither loss nor gradients."""
         target = torch.full((1, 3, 6), float("nan"))
         state = torch.ones((1, 3, 6), dtype=torch.int64)
-        target[0, 0, :2], target[0, 1, :2], target[0, 2, :2] = torch.tensor([1., 2.]), torch.tensor([100., 200.]), torch.tensor([2., 0.])
+        target[0, 0, :2], target[0, 1, :2], target[0, 2, :2] = (
+            torch.tensor([1., 2.]),
+            torch.tensor([100., 200.]),
+            torch.tensor([2., 0.]),
+        )
         state[:, :, :2] = 0
         prediction = torch.zeros_like(target, requires_grad=True)
+
         totals = error_totals(prediction, target, state, torch.tensor([1., 0., 3.]))
-        torch.testing.assert_close(totals, torch.tensor([17., 8., 9., 5., 4.], dtype=torch.float64))
+        torch.testing.assert_close(
+            totals, torch.tensor([17., 8., 9., 5., 4.], dtype=torch.float64)
+        )
         loss = totals[0] / totals[1]
         self.assertEqual(float(loss), 17 / 8)
+
         loss.backward()
         self.assertTrue(torch.isfinite(prediction.grad).all())
         self.assertEqual(float(prediction.grad[:, 1].abs().sum()), 0.0)
@@ -75,6 +130,7 @@ class NumericsTests(SyntheticDatasetTestCase):
         torch.testing.assert_close(prediction.grad[0, 2, :2], torch.tensor([-1.5, 0.0]))
 
     def test_population_metric_reduction(self):
+        """Reduce error sums and eligible counts before calculating RMSE and MAE."""
         target = torch.zeros(2, 1, 6)
         prediction = torch.ones_like(target)
         prediction[0] = 3.0
@@ -82,9 +138,11 @@ class NumericsTests(SyntheticDatasetTestCase):
         state[0, :, 1:] = 3
         target[state != 0] = float("nan")
         weights = torch.ones(1)
+
         first = error_totals(prediction[:1], target[:1], state[:1], weights)
         second = error_totals(prediction[1:], target[1:], state[1:], weights)
         totals = first + second
+
         torch.testing.assert_close(totals, error_totals(prediction, target, state, weights))
         torch.testing.assert_close(totals[2:], torch.tensor([15., 9., 7.], dtype=torch.float64))
         self.assertAlmostEqual(float((totals[2] / totals[4]).sqrt()), math.sqrt(15 / 7))
@@ -93,10 +151,12 @@ class NumericsTests(SyntheticDatasetTestCase):
         self.assertEqual(set(metrics), {"all_rmse", "all_mae"})
         self.assertAlmostEqual(metrics["all_rmse"], math.sqrt(15 / 7))
         self.assertAlmostEqual(metrics["all_mae"], 9 / 7)
+        # Different valid counts make averaging per-batch RMSE incorrect.
         batch_average_rmse = ((first[2] / first[4]).sqrt() + (second[2] / second[4]).sqrt()) / 2
         self.assertNotAlmostEqual(float((totals[2] / totals[4]).sqrt()), float(batch_average_rmse))
 
     def test_gradient_accumulation_matches_whole_windows(self):
+        """Match whole-window Adam updates even with unequal masks and a short tail."""
         generator = torch.Generator().manual_seed(19)
         forcing = torch.randn(5, 1, 5, 2, 2, generator=generator)
         target = torch.randn(5, 3, 6, generator=generator)
@@ -107,7 +167,11 @@ class NumericsTests(SyntheticDatasetTestCase):
         weights = torch.tensor([0.5, 2.0, 5.0])
         accumulated, whole = SmokeModel(), SmokeModel()
         whole.load_state_dict(accumulated.state_dict())
-        optimizers = [torch.optim.Adam(model.parameters(), lr=0.001) for model in (accumulated, whole)]
+        optimizers = [
+            torch.optim.Adam(model.parameters(), lr=0.001)
+            for model in (accumulated, whole)
+        ]
+
         # Three microbatches of sizes 2, 2, 1 with accumulation=2: final window is partial.
         for start, end in ((0, 4), (4, 5)):
             for optimizer in optimizers:
@@ -119,13 +183,19 @@ class NumericsTests(SyntheticDatasetTestCase):
                 totals = error_totals(prediction, target[offset:stop], state[offset:stop], weights)
                 totals[0].backward()
                 denominator += totals[1].detach()
+
+            # Divide once by the window's weighted valid count; averaging
+            # microbatch losses would give different gradients for these masks.
             for parameter in accumulated.parameters():
                 parameter.grad.div_(denominator)
+
             prediction = whole({"forcing": forcing[start:end]}, self.mesh)["surge"]
             totals = error_totals(prediction, target[start:end], state[start:end], weights)
             (totals[0] / totals[1]).backward()
+
             for actual, expected in zip(accumulated.parameters(), whole.parameters()):
                 torch.testing.assert_close(actual.grad, expected.grad, rtol=1e-5, atol=1e-7)
+
             for optimizer in optimizers:
                 optimizer.step()
             for actual, expected in zip(accumulated.parameters(), whole.parameters()):
