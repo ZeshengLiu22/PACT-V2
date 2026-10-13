@@ -25,6 +25,24 @@ spatial_weighting:
 
 model:
   name: smoke
+  # Base: name: base; variant: mlp | gnn | stgnn
+  # Defaults: hidden_dim: 64, gnn_layers: 2, temporal_hidden_dim: 32
+  # IGARSS: name: igarss27
+  # temporal_encoder: gru | lstm | temporal_cnn | tcn
+  # temporal_hidden_dim: 32
+  # spatial_encoder: unet
+  # unet_channels: [32, 64, 128]
+  # scales: [0, 1, 2]
+  # projector: bilinear
+  # projected_dim: 32
+  # mesh_encoder: gnn
+  # mesh_hidden_dim: 32
+  # mesh_encoder_layers: 2
+  # fusion: concat | adaptive
+  # decoder: mlp | gnn
+  # decoder_hidden_dim: 64
+  # decoder_gnn_layers: 2
+  # History stays in data.history_hours: 0, 6, ..., 48; output always six hours.
 
 loss:
   global_mse: true

@@ -17,6 +17,7 @@ from emulator.data.loaders import build_loaders, loader_options
 from emulator.data.mesh import load_mesh
 from emulator.data.normalization import compute_normalization, prepare_normalization
 from emulator.data.splits import split_years
+from emulator.models import BaseModel, FullA0Model, FullA1Model, IGARSS27Model
 from emulator.models.smoke import SmokeModel
 from emulator.training.checkpoints import (
     load_resume,
@@ -209,7 +210,29 @@ def run(config, smoke_test):
 
     # Construct and restore the raw model before wrapping it for distributed training.
     logger.info("Training initialization started")
-    raw_model = SmokeModel().to(device)
+    # Resume reconstructs architecture and history width from saved settings.
+    model_config = (resume["config"] if resume else config)
+    name = model_config["model"]["name"]
+    if name in ("base", "igarss27"):
+        # Dataset tensors are still physical here; model_inputs normalizes later.
+        forcing_grid = datasets["train"][0]["forcing"][-1, 3:5]
+        if name == "base":
+            raw_model = BaseModel(
+                model_config["model"], mesh_cpu, forcing_grid,
+                history_hours=model_config["data"]["history_hours"],
+            )
+        else:
+            raw_model = IGARSS27Model(model_config["model"], mesh_cpu, forcing_grid)
+        logger.info("Bilinear projection: all %d mesh nodes inside physical forcing grid", len(node_id))
+    elif name == "full_v1":
+        raw_model = FullA0Model()
+    elif name == "full_v2":
+        raw_model = FullA1Model()
+    elif name == "smoke":
+        raw_model = SmokeModel()
+    else:
+        raise ValueError(f"Unknown model identifier: {name}")
+    raw_model = raw_model.to(device)
     log_model_parameters(raw_model)
     optimizer, scheduler = build_optimizer_scheduler(raw_model, train)
     start_epoch, best_rmse, best_epoch = restore_training_state(
@@ -219,7 +242,14 @@ def run(config, smoke_test):
         log_resume(resume, train["resume_from"])
     model = (
         DistributedDataParallel(
-            raw_model, device_ids=[device.index] if device.type == "cuda" else None
+            raw_model, device_ids=[device.index] if device.type == "cuda" else None,
+            # Mesh geometry and sparse adjacency are immutable and identical
+            # on every rank; sparse buffers cannot use dense DDP broadcasts.
+            broadcast_buffers=False,
+            # Coarse-only projections leave finer U-Net decoder weights unused.
+            find_unused_parameters=(
+                name == "igarss27" and 0 not in model_config["model"].get("scales", [0, 1, 2])
+            ),
         )
         if world > 1
         else raw_model

@@ -26,11 +26,11 @@ def validate_config(config):
         raise NotImplementedError("Tail and Episode Peak losses await the Episode Audit")
 
     # Reserved names must fail explicitly rather than silently using SmokeModel.
-    if config["model"]["name"] != "smoke":
-        if config["model"]["name"] in ("base", "igarss27", "full_v1", "full_v2"):
-            raise NotImplementedError(
-                f"{config['model']['name']} architecture has not been implemented"
-            )
+    if config["model"]["name"] in ("full_v1", "full_v2"):
+        raise NotImplementedError(
+            f"{config['model']['name']} architecture has not been implemented"
+        )
+    if config["model"]["name"] not in ("smoke", "base", "igarss27"):
         raise ValueError("Unknown model identifier")
 
     evaluation = config["evaluation"]

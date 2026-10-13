@@ -3,8 +3,10 @@
 A PyTorch training framework over the existing model-ready monthly sample
 lists, organized into data, model, and training modules. `smoke` is a trainable
 linear pipeline check, not a scientific emulator.
-The reserved `base`, `igarss27`, `full_v1`, and `full_v2` architectures are not
-implemented.
+`base` implements MLP, GNN, and temporal-first ST-GNN baselines. `igarss27`
+implements temporal encoding, a spatial U-Net, bilinear mesh projection,
+static mesh encoding, scale fusion, and MLP/GNN decoding. `full_v1` (A0) and
+`full_v2` (A1) remain independent interfaces that raise `NotImplementedError`.
 
 ## Repository structure
 
@@ -12,6 +14,7 @@ implemented.
 scripts/
     __init__.py
     train.py                      # CLI and experiment orchestration
+    benchmark_models.py           # One-update real-data model diagnostics
 configs/ncep.yaml                 # Existing experiment configuration
 emulator/
     __init__.py
@@ -25,6 +28,11 @@ emulator/
     models/
         __init__.py
         smoke.py                  # Existing linear SmokeModel
+        base.py                   # Base MLP / GNN / ST-GNN
+        igarss27.py                # IGARSS temporal / spatial / fusion / decoder variants
+        common.py                 # Physical bilinear projector and shared sparse GNN
+        full_a0.py                # Deferred Full A0 interface
+        full_a1.py                # Deferred Full A1 interface
     training/
         __init__.py
         config.py                 # YAML loading and supported-option validation
@@ -41,6 +49,8 @@ tests/
     test_dataset.py               # Splits, indexing, history, mesh/node identity
     test_numerics.py              # Normalization, weights, loss, metrics, gradients
     test_training.py              # Forward/backward and checkpoint/resume
+    test_models.py                # All histories/variants and geometry regressions
+    test_model_integration.py     # Model variants through trainer and saved-config reload
     test_logging.py               # Formatting, persistence, resume, and rank ownership
 README.md
 ```
@@ -51,8 +61,8 @@ coordinates the experiment; numerical code and model definitions live in the
 package. The
 structure follows the responsibility boundaries of
 [StormSurge](https://github.com/ZeshengLiu22/StormSurge), retaining PACT-V2's
-full-field tensor contracts and loading strategy. No registry, manager, callback
-framework, or future-model placeholder is required.
+full-field tensor contracts and loading strategy. The existing SmokeModel stays
+in its original module; model selection is a small conditional in the trainer.
 
 ## Run
 
@@ -141,6 +151,205 @@ population. DDP evaluation partitions indices without padding. Gradient
 accumulation divides summed gradients by the complete accumulation window's
 weight count, including partial windows and distributed reduction.
 
+## Base and IGARSS models
+
+Every model returns `model(batch, mesh)["surge"]` as normalized `[B,N,6]`.
+The existing trainer still owns normalization, physical-meter loss, WW validity,
+spatial weighting, metrics, and checkpoint selection. Base/IGARSS ignore tidal
+predictors and use weather channels 0:3. No bathymetry or target/state inputs
+enter these models. No Dataset, preprocessing, source-data, or loss changes are
+needed. History remains `data.history_hours`, one of `0,6,...,48`:
+
+| History hours | 48 | 42 | 36 | 30 | 24 | 18 | 12 | 6 | 0 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Input steps T | 9 | 8 | 7 | 6 | 5 | 4 | 3 | 2 | 1 |
+| Base MLP/GNN input width | 32 | 29 | 26 | 23 | 20 | 17 | 14 | 11 | 8 |
+
+Base MLP/GNN derive their first-layer width at initialization from
+`3*T+5`; a mismatched input history raises a clear error. ST-GNN and IGARSS use
+history-independent temporal weights and accept every nonempty supported
+sequence, including the single issue-time frame at H=0. All heads stay width 6.
+
+Base architectures (default hidden width 64):
+
+- `mlp`: flatten raw weather to 3*T channels, bilinear projection, concatenate
+  five mesh features, Linear(64)/GELU/Linear(64)/GELU/Linear(6).
+- `gnn`: the same raw projection and static features, two mean-neighbor GNN
+  layers of width 64, Linear(6).
+- `stgnn`: project each raw weather time independently, shared single-layer
+  GRU(3,32) per node, concatenate five mesh features, two width-64 GNN layers,
+  Linear(6). Time is never flattened into input features for this variant.
+
+IGARSS uses a temporal-only encoder independently at each atmospheric cell:
+single-layer GRU/LSTM(3,32), a two-layer padded Conv1d temporal CNN with mean
+readout, or a three-layer causal Conv1d TCN with dilations 1/2/4 and final-time
+readout. The TCN receptive field covers all nine allowed frames; left padding
+also supports T=1. None of these blocks mixes neighboring atmospheric cells.
+
+The separate spatial U-Net has encoder widths [32,64,128], two 3x3/ReLU
+convolutions per block, bilinear down/up resizing, and concatenated skip
+connections. F0/F1 are decoded full/half-resolution features; F2 is the coarse
+bottleneck. For the real 29x32 grid these are 29x32, 14x16, and 7x8. Resizing
+uses `align_corners=True` and exact skip sizes, preserving endpoint coordinates
+and odd dimensions. The U-Net architecture is unchanged across scale subsets.
+Only selected features pass through 1x1 convolutions to 32 channels before
+bilinear projection. Any nonempty subset of [0,1,2] is supported.
+
+The **static mesh encoder** is a separate two-layer, width-32 GNN over the five
+mesh features, evaluated once per forward. Fusion concatenates projected
+features and broadcasts static features. Adaptive fusion uses a shared
+Linear(64,32)/Tanh/Linear(32,1) score, softmax over scales, and **weighted
+concatenation**. Its default 2,113 extra parameters leave the fused width
+unchanged: 32*number_of_scales+32. Single-scale adaptive weight is exactly one.
+The **dynamic mesh decoder** is either two width-64 Linear/ReLU layers or a
+separate two-layer width-64 GNN, followed by Linear(6). Static and dynamic GNNs
+have independent weights.
+
+Every graph layer uses self features plus the incoming-neighbor mean. One
+normalized sparse [N,N] adjacency handles features reshaped to [N,B*C]; no
+batched edge copies or dense adjacency are constructed. Sparse multiplication
+and interpolation use FP32 inside autocast. DDP does not broadcast immutable
+geometry buffers; coarse-only IGARSS projections enable unused-parameter
+detection for the unused finer U-Net decoder weights.
+
+Replace only the `model` section of the existing complete YAML, for example:
+
+```yaml
+model:
+  name: base
+  variant: stgnn                 # mlp | gnn | stgnn
+  hidden_dim: 64
+  gnn_layers: 2
+  temporal_hidden_dim: 32
+```
+
+```yaml
+model:
+  name: igarss27
+  temporal_encoder: gru         # gru | lstm | temporal_cnn | tcn
+  temporal_hidden_dim: 32
+  spatial_encoder: unet
+  unet_channels: [32, 64, 128]
+  scales: [0, 1, 2]
+  projector: bilinear
+  projected_dim: 32
+  mesh_encoder: gnn
+  mesh_hidden_dim: 32
+  mesh_encoder_layers: 2
+  fusion: adaptive              # concat | adaptive
+  decoder: gnn                  # mlp | gnn
+  decoder_hidden_dim: 64
+  decoder_gnn_layers: 2
+```
+
+The default complete YAML remains the diagnostic smoke experiment with batch
+size 64 and accumulation 1. Resume reconstructs Base/IGARSS from the saved model
+configuration and `data.history_hours` before loading weights; changing history
+or architecture on resume is rejected by the existing identity checks. Full A0
+and A1 have only independent, explicitly unimplemented interfaces.
+
+### Physical projection geometry
+
+The actual NCEP grid has longitude increasing from -99.375 to -41.25 degrees
+at 1.875-degree spacing, and latitude decreasing from 54.284599 to 0.952368
+degrees with slightly nonuniform spacing (about 1.9047 degrees). It is
+rectilinear. Canonical mesh bounds are longitude [-97.852112,-59.858116] and
+latitude [7.912744,45.973202]. All 159,444 nodes are covered; outside count is 0.
+The first and last sample in each of all 177 monthly files were checked:
+all 354 nine-frame coordinate histories match the same grid.
+
+The projector takes original physical longitude/latitude from the Dataset
+before normalization. It uses interval lookup on each observed axis to compute
+fractional source indices, including descending and nonuniform axes, and caches
+normalized sampling positions once. All scales use the same endpoint-aligned
+positions with `grid_sample(..., align_corners=True)`. Node order is preserved.
+Nonrectilinear grids or outside nodes raise errors; outside errors include the
+count and first ten node indices/locations. Coordinates are never silently
+reversed, clipped, or interpreted as normalized weather features. This is
+bilinear interpolation, not a neural operator. No unresolved NCEP geometry
+issue was found.
+
+### Model validation and measured CPU runtime (2026-10-13)
+
+Implemented and tested on PyTorch 2.7.1+cu126, CPU:
+
+- Complete unit suite: **38 tests passed**, including the existing 19 pipeline
+  regressions and the new model/integration tests.
+- All nine histories for all three Base variants (27 forward/backward cases).
+- All nine histories for all four IGARSS temporal encoders, both fusions, both
+  decoders, and all seven nonempty scale subsets (1,008 forward/backward cases).
+  Every used parameter has finite gradients. Coarse-only subsets intentionally
+  leave finer U-Net decoder parameters unused while preserving the architecture.
+- Temporal cell independence, TCN causality and oldest-frame influence, odd-size
+  skip connections, analytic bilinear interpolation and orientation, independent
+  static/dynamic GNN weights, shared graph topology, and adaptive weighted fusion.
+- Saved-config model reconstruction at both history endpoints; 20 existing-trainer
+  update/evaluation/checkpoint/resume cases across ten representative variants.
+- Fifty real NCEP trainer updates: ten representative cases at H=48,42,36,24,0,
+  batch size 1, all 159,444 nodes and 907,014 directed edges. Every result was
+  `[1,159444,6]` with finite output, physical loss, and all parameter gradients.
+- Actual CLI smoke and resume for Base GNN H0 and IGARSS TCN/adaptive/GNN H42
+  passed on a small synthetic five-year dataset, including global shuffle and
+  selected-checkpoint verification. Evidence is retained in
+  `/glade/u/home/zel/tmp/pact_models_cli_83ovsfcp/report.json`.
+- Two-process CPU DDP passed at H0/H48 for Base GNN/ST-GNN and IGARSS adaptive
+  GNN decoding, including coarse-only [2] and [1,2] scales. CPU BF16 diagnostics
+  passed for temporal variants; this does not validate CUDA BF16 kernels.
+
+Real-data diagnostics reused the previously saved **full TRAIN H48** normalization
+and source-year 1979 samples. Shorter histories reused these statistics only to
+test shape/runtime; their losses are not scientific evaluation results. Normal
+training still computes full TRAIN statistics for its configured history.
+
+The following are measured first-update times, with four CPU threads, batch 1,
+H48, full mesh, and default widths. Forward excludes the physical loss; backward
+includes loss gradients; Adam timing excludes gradient validation. These are
+single diagnostic updates including lazy initialization, not throughput estimates.
+
+| Case | Configuration | Parameters | Forward s | Backward s | Adam s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| B1 | Base MLP | 6,662 | 0.0413 | 0.2621 | 0.0011 |
+| B2 | Base GNN | 12,806 | 0.1239 | 0.2483 | 0.0005 |
+| B3 | Base ST-GNN | 16,998 | 0.4186 | 1.7079 | 0.0007 |
+| I1 | GRU, all scales, concat, MLP | 505,926 | 0.1655 | 0.3217 | 0.0024 |
+| I2 | GRU, all scales, adaptive, MLP | 508,039 | 0.2169 | 0.4005 | 0.0026 |
+| I3 | GRU, all scales, adaptive, GNN | 520,327 | 0.3242 | 0.5849 | 0.0026 |
+| I4 | GRU, scale [0], concat, MLP | 495,622 | 0.1362 | 0.2960 | 0.0023 |
+| LSTM | LSTM, all scales, concat, MLP | 507,110 | 0.1956 | 0.3198 | 0.0024 |
+| Temporal CNN | temporal CNN, all scales, concat, MLP | 505,798 | 0.1606 | 0.3225 | 0.0027 |
+| TCN | causal TCN, all scales, concat, MLP | 508,902 | 0.1655 | 0.3282 | 0.0027 |
+
+CPU process cumulative high-water RSS reached 0.760 GiB after B1, 0.852 GiB
+after B2, and 2.484 GiB after B3 and all subsequent cases. These are process
+high-water marks, not isolated per-model memory measurements. Separate component
+profiling found the B3 temporal GRU took 0.292/0.424 s of forward time (69%).
+For I3, the dynamic GNN decoder took 0.146/0.327 s (45%) and the static mesh GNN
+took 0.073 s (22%). No performance-driven architectural changes were made.
+
+Full per-history measurements and profiling evidence are retained at
+`/glade/u/home/zel/tmp/pact_v2_models_evidence/cpu_histories.json` and
+`/glade/u/home/zel/tmp/pact_v2_models_evidence/cpu_stage_profiles.json`.
+Geometry evidence is in the same directory's `geometry_consistency.json`.
+
+**Not tested:** CUDA forward/backward, GPU BF16/sparse operations, GPU memory,
+and batch size 64. This allocation has no available CUDA device. The configured
+batch size remains 64; no GPU-memory feasibility claim is made. On a GPU
+allocation, run from the repository root:
+
+```bash
+/glade/work/zel/conda-envs/pact-casper-cu126/bin/python -m scripts.benchmark_models \
+  --device cuda --batch-sizes 1 64 --histories 48 42 36 24 0 \
+  --output /glade/u/home/zel/tmp/pact_v2_models_evidence/gpu.json
+```
+
+The benchmark synchronizes CUDA timings, reports GPU model and peak allocated/
+reserved memory, records OOM/failure without reducing batch size, and exits
+nonzero if any case fails. Smaller batches cover all ten cases and selected
+histories; larger batches cover B1-B3/I1-I4 at H48. Use `--device cpu
+--batch-sizes 1` for CPU diagnostics, or `--profile-stages --cases B3 I3
+--histories 48` for component timings. Full A0/A1, scientific model selection,
+and full training experiments are deferred.
+
 ## Outputs and timing
 
 Each run writes `resolved_config.yaml`, `split_manifest.json`, `normalization.pt`,
@@ -190,11 +399,11 @@ written to `train.log`.
 
 `smoke` uses a linear layer over spatially averaged latest forcing and broadcasts
 its six outputs to every mesh node. It is an integration model. Reserved
-`base`, `igarss27`, `full_v1`, and `full_v2` names fail explicitly.
+`full_v1` and `full_v2` names fail explicitly; Base and IGARSS are implemented.
 
 Tail and GT-aligned Episode Peak losses await the Episode Audit. Nonzero weights
 fail clearly. The nine canonical extreme/episode metrics, exceedance checkpoint
-selection, real model architectures, and cross-dataset inference remain pending.
+selection, Full A0/A1 architectures, and cross-dataset inference remain pending.
 The only reported scientific metrics are `all_rmse` and `all_mae`, following the
 [reference metrics](https://github.com/ZeshengLiu22/StormSurge/blob/main/docs/METRICS.md).
 
