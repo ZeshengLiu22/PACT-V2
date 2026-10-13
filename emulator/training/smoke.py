@@ -1,14 +1,16 @@
 """Smoke-only random-access profiling and observed shuffle verification."""
 
-import json
 import time
 
 import torch
 from torch.utils.data import DataLoader
 
+from emulator.training.logging import logger, log_loading_benchmark
+
 
 def benchmark_loading(dataset, loader_options, seed, runtime):
     """Record at most six shuffled batch-load timings without model computation."""
+    logger.info("Smoke random-access DataLoader benchmark started: up to six shuffled batches")
     # A separate generator keeps profiling from advancing training sample order.
     benchmark_loader = DataLoader(
         dataset, shuffle=True,
@@ -39,10 +41,7 @@ def benchmark_loading(dataset, loader_options, seed, runtime):
     }
     # Drop the benchmark's worker/loader references before training begins.
     del benchmark_iterator, benchmark_loader
-    print(
-        "Random-access DataLoader benchmark: " + json.dumps(runtime["random_access_benchmark"]),
-        flush=True,
-    )
+    log_loading_benchmark(runtime["random_access_benchmark"])
 
 
 def record_shuffle(dataset, sampler, seed, epoch, batch_size, runtime):

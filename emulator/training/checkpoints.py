@@ -7,6 +7,8 @@ from pathlib import Path
 import torch
 from torch import distributed as dist
 
+from emulator.training.logging import logger, log_best_checkpoint
+
 
 def load_resume(config, node_id, splits, smoke_test):
     """Load a CPU checkpoint only if experiment identity and settings match.
@@ -79,7 +81,6 @@ def restore_training_state(resume, raw_model, optimizer, scheduler, output_dir):
         # have access to the checkpoint previously selected on validation RMSE.
         if best_epoch is not None and not (output_dir / "best_overall.pt").is_file():
             raise FileNotFoundError("Resume requires the run's validation-selected best_overall.pt")
-        print(f"Resumed last.pt at epoch {start_epoch}; normalization reused", flush=True)
     return start_epoch, best_rmse, best_epoch
 
 
@@ -108,8 +109,10 @@ def save_checkpoint(
         "smoke_test": smoke_test,
     }
     torch.save(checkpoint, output_dir / "last.pt")
+    logger.info("Saved checkpoint: %s", output_dir / "last.pt")
     if improved:
         torch.save(checkpoint, output_dir / "best_overall.pt")
+        log_best_checkpoint(epoch, val_metrics, output_dir / "best_overall.pt")
 
 
 def load_selected_checkpoint(output_dir, raw_model):

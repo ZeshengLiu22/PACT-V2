@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
+from emulator.training.logging import logger
+
 
 def month_moments(path, history_steps):
     """Return forcing [C] and scalar WW surge sums, squared sums, and counts.
@@ -72,7 +74,7 @@ def compute_normalization(dataset, num_workers=1):
             surge_sq += sq
             surge_count += sc
             if month % 10 == 0 or month == len(dataset.files):
-                print(f"Normalization: {month}/{len(dataset.files)} TRAIN months", flush=True)
+                logger.info("Normalization: %s/%s TRAIN months", month, len(dataset.files))
 
     if not forcing_count or not surge_count:
         raise ValueError("TRAIN normalization has no valid observations")

@@ -1,11 +1,14 @@
 """Training and evaluation with complete weighted accumulation windows."""
 
 from contextlib import nullcontext
+import logging
+import math
 import time
 
 import torch
 from torch import distributed as dist
 
+from emulator.training.logging import logger, log_batch_progress
 from emulator.training.losses import error_totals
 from emulator.training.metrics import overall_metrics
 from emulator.training.smoke import record_shuffle, verify_batch_order
@@ -127,6 +130,8 @@ def train_one_epoch(
     denominator = torch.zeros((), device=device, dtype=torch.float64)
     optimizer.zero_grad(set_to_none=True)
     steps = min(4, len(train_loader)) if smoke_test else len(train_loader)
+    progress_start = time.perf_counter()
+    last_progress = progress_start
     tick = time.perf_counter()
     iterator = iter(train_loader)
     for step in range(steps):
@@ -194,12 +199,25 @@ def train_one_epoch(
                 torch.cuda.synchronize(device)
             runtime["optimizer_seconds"].append(time.perf_counter() - tick)
 
-        if smoke_test:
-            print(
-                f"epoch={epoch} batch={step + 1}/{steps} "
-                f"physical_mse={(batch_totals[0] / batch_totals[1]).item():.6f}",
-                flush=True,
-            )
+        # Read a scalar only when rank zero will report it. DDP progress uses
+        # local sums; the existing epoch-end reduction supplies global summaries.
+        if logger.isEnabledFor(logging.INFO):
+            now = time.perf_counter()
+            if (
+                smoke_test
+                or step == 0
+                or (step + 1) % 25 == 0
+                or step + 1 == steps
+                or now - last_progress >= 60
+            ):
+                progress_totals = batch_totals if smoke_test else total
+                progress_mse = (progress_totals[0] / progress_totals[1]).item()
+                log_batch_progress(
+                    epoch, train["epochs"], step + 1, steps,
+                    progress_mse if math.isfinite(progress_mse) else None,
+                    now - progress_start, smoke_test=smoke_test, world=world,
+                )
+                last_progress = now
         tick = time.perf_counter()
 
     if world > 1:

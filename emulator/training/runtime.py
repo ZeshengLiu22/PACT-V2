@@ -10,6 +10,8 @@ import threading
 import torch
 from torch import distributed as dist
 
+from emulator.training.logging import logger
+
 
 def initialize_runtime(config):
     """Configure reproducibility and return device, world size, rank, and AMP flag."""
@@ -52,9 +54,9 @@ def initialize_runtime(config):
     use_amp = train["amp"] and device.type == "cuda"
     if use_amp and not torch.cuda.is_bf16_supported():
         raise RuntimeError("Requested bf16 AMP is unsupported by this CUDA device")
-    print(
-        f"rank={rank}/{world} device={device} torch={torch.__version__} AMP={use_amp}",
-        flush=True,
+    logger.info(
+        "Runtime: rank %s/%s | Device: %s | PyTorch: %s | AMP: %s (bf16)",
+        rank, world, device, torch.__version__, "enabled" if use_amp else "disabled",
     )
     return device, world, rank, use_amp
 

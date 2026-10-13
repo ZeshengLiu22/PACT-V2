@@ -33,6 +33,7 @@ emulator/
         metrics.py                # Complete-population overall RMSE/MAE
         checkpoints.py            # Saving, resume validation, and state restoration
         runtime.py                # Device/DDP setup, timing, and memory monitoring
+        logging.py                # Timestamped console/train.log messages and summaries
         smoke.py                  # Loading benchmark and shuffle diagnostics
 tests/
     __init__.py
@@ -40,6 +41,7 @@ tests/
     test_dataset.py               # Splits, indexing, history, mesh/node identity
     test_numerics.py              # Normalization, weights, loss, metrics, gradients
     test_training.py              # Forward/backward and checkpoint/resume
+    test_logging.py               # Formatting, persistence, resume, and rank ownership
 README.md
 ```
 
@@ -142,8 +144,9 @@ weight count, including partial windows and distributed reduction.
 ## Outputs and timing
 
 Each run writes `resolved_config.yaml`, `split_manifest.json`, `normalization.pt`,
-`last.pt`, `best_overall.pt`, `training_metrics.jsonl`, and `summary.json`.
-Only VAL AllRMSE selects `best_overall.pt`; final TEST uses that checkpoint.
+`last.pt`, `best_overall.pt`, `training_metrics.jsonl`, and `summary.json`, plus
+`train.log` for human-readable messages. The JSONL and summary schemas remain
+unchanged. Only VAL AllRMSE selects `best_overall.pt`; final TEST uses that checkpoint.
 No predictions or per-node diagnostics are exported.
 
 `summary.json` includes measured initialization, standalone random-access
@@ -154,6 +157,34 @@ and process-tree PSS sampled every 0.5 seconds (shared mappings/IPC pages are
 apportioned instead of counted once per worker). Sampling can miss brief peaks.
 CUDA peak allocated memory is null when CUDA is unavailable. Timings reflect
 filesystem caching and concurrent HPC activity, not guaranteed throughput.
+
+## Training logs
+
+Python writes timestamped `[YYYY-MM-DD|HH:MM:SS]` messages to the console and
+`<output_dir>/train.log`; no shell launcher is needed. Early device/indexing
+messages appear immediately in the console. File logging begins after resume
+identity and output-directory checks, with a concise initialization summary.
+The log includes normalization progress, actual model parameter counts,
+checkpoint events, final metrics, and existing timing/memory measurements.
+
+Every epoch reports weighted TRAIN GlobalMSE in m², the actual learning rate,
+and newly measured VAL AllRMSE/AllMAE in m when validation is scheduled.
+Otherwise it explicitly reports that VAL was not scheduled. Displayed epochs
+are 1-based; checkpoint and JSONL epoch numbering is unchanged.
+
+Normal batch progress appears after the first batch, every 25 batches, the
+final batch, or after at least 60 seconds since the previous report, checked
+when a batch completes. Smoke mode retains every batch diagnostic.
+Normalization still reports every ten monthly files and the last file.
+
+New runs start a fresh `train.log`. YAML resume appends to the original run's
+log and prints a `RESUMING TRAINING` separator, restored/starting epochs,
+previous best checkpoint state, and normalization reuse. Under DDP only rank
+zero writes normal messages and the shared file. Batch progress is explicitly
+rank-zero-local; epoch summaries retain the existing global reductions.
+Other ranks report errors with their rank in the console. Exceptions retain
+tracebacks and still fail the process; available rank-zero tracebacks are also
+written to `train.log`.
 
 ## Known limitations
 

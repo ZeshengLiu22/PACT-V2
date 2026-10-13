@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import time
 
@@ -27,6 +28,16 @@ from emulator.training.checkpoints import (
 )
 from emulator.training.config import load_config
 from emulator.training.engine import build_optimizer_scheduler, evaluate, train_one_epoch
+from emulator.training.logging import (
+    close_logging,
+    configure_logging,
+    log_epoch,
+    log_final,
+    log_initialization,
+    log_model_parameters,
+    log_resume,
+    logger,
+)
 from emulator.training.losses import load_spatial_weights
 from emulator.training.metrics import training_metrics
 from emulator.training.runtime import (
@@ -72,6 +83,12 @@ def run(config, smoke_test):
     Smoke mode keeps full TRAIN normalization but limits training and held-out
     evaluation. Only rank zero writes artifacts; all ranks participate in DDP.
     """
+    wall_start = time.perf_counter()
+    logger.info(
+        "Starting experiment: %s | Source: %s | Model: %s",
+        config["experiment"]["name"], config["data"]["source"], config["model"]["name"],
+    )
+
     # Initialize the runtime before indexing so memory measurements include data setup.
     train, evaluation = config["training"], config["evaluation"]
     seed = config["experiment"]["seed"]
@@ -95,11 +112,15 @@ def run(config, smoke_test):
     datasets = {}
     for name, years in splits.items():
         if years:
-            print(f"Indexing {name}: {len(years)} simulation years", flush=True)
+            logger.info("Indexing %s: %d simulation years", name.upper(), len(years))
+            indexing_start = time.perf_counter()
             datasets[name] = FullFieldDataset(
                 directory, years, mesh_cpu, config["data"]["history_hours"]
             )
-            print(f"Indexed {name}: {len(datasets[name])} samples", flush=True)
+            logger.info(
+                "Indexed %s: %d samples | Time: %.2fs",
+                name.upper(), len(datasets[name]), time.perf_counter() - indexing_start,
+            )
 
     runtime = {
         "device": str(device),
@@ -112,7 +133,11 @@ def run(config, smoke_test):
         "mesh_nodes": len(node_id),
         "mesh_directed_edges": mesh_cpu["edge_index"].shape[1],
     }
-    print(json.dumps(runtime), flush=True)
+    logger.info(
+        "Dataset initialization complete: %.2fs | Mesh: %d nodes, %d directed edges",
+        runtime["dataset_initialization_seconds"], runtime["mesh_nodes"],
+        runtime["mesh_directed_edges"],
+    )
 
     # Resume identity checks precede writes to an existing experiment directory.
     resume = load_resume(config, node_id, splits, smoke_test)
@@ -123,7 +148,21 @@ def run(config, smoke_test):
             runtime["sample_counts"],
         )
 
+    # File logging starts only after the same resume/path checks that guard artifacts.
+    configure_logging(rank=rank, output_dir=output_dir, resume=resume is not None)
+    log_initialization(
+        config, runtime, splits, output_dir, use_amp,
+        datasets["train"][0]["surge"].shape[-1], smoke_test,
+    )
+
     # Fit statistics only on TRAIN, once on rank zero, or reuse the saved statistics.
+    if resume:
+        logger.info("TRAIN normalization: reusing saved statistics from %s", train["resume_from"])
+    else:
+        logger.info(
+            "TRAIN normalization started: %d months, %d samples (full TRAIN population)",
+            len(datasets["train"].files), len(datasets["train"]),
+        )
     stats_start = time.perf_counter()
     normalization = (
         resume["normalization"]
@@ -139,6 +178,11 @@ def run(config, smoke_test):
         dist.broadcast_object_list(payload, src=0)
         normalization = payload[0]
     runtime["normalization_seconds"] = time.perf_counter() - stats_start
+    logger.info(
+        "TRAIN normalization %s | Time: %.2fs | Forcing observations/channel: %d | WW targets: %d",
+        "reused" if resume else "complete", runtime["normalization_seconds"],
+        normalization["forcing_count_per_channel"], normalization["surge_count"],
+    )
     if rank == 0:
         torch.save(normalization, output_dir / "normalization.pt")
 
@@ -148,21 +192,31 @@ def run(config, smoke_test):
     mesh = {k: v.to(device) for k, v in mesh_cpu.items()}
 
     # Keep loader setup and its standalone benchmark separate from training timings.
+    logger.info("DataLoader initialization started")
     options = loader_options(config)
     start = time.perf_counter()
     train_loader, eval_loaders, sampler, generator = build_loaders(
         datasets, train, options, seed, world, rank, smoke_test
     )
     runtime["dataloader_initialization_seconds"] = time.perf_counter() - start
+    logger.info(
+        "DataLoader initialization complete | Time: %.3fs | Workers: %d | Batch size: %d",
+        runtime["dataloader_initialization_seconds"], config["dataloader"]["num_workers"],
+        train["batch_size"],
+    )
     if smoke_test:
         benchmark_loading(datasets["train"], options, seed, runtime)
 
     # Construct and restore the raw model before wrapping it for distributed training.
+    logger.info("Training initialization started")
     raw_model = SmokeModel().to(device)
+    log_model_parameters(raw_model)
     optimizer, scheduler = build_optimizer_scheduler(raw_model, train)
     start_epoch, best_rmse, best_epoch = restore_training_state(
         resume, raw_model, optimizer, scheduler, output_dir
     )
+    if resume:
+        log_resume(resume, train["resume_from"])
     model = (
         DistributedDataParallel(
             raw_model, device_ids=[device.index] if device.type == "cuda" else None
@@ -179,8 +233,15 @@ def run(config, smoke_test):
         training_batch_sizes=[],
     )
 
+    logger.info(
+        "Training initialization complete | Starting epoch: %03d | Epochs this invocation: %d",
+        start_epoch + 1, max(0, last_epoch - start_epoch),
+    )
+    training_start = time.perf_counter()
+
     # Select checkpoints exclusively by VAL AllRMSE; TEST never affects training.
     for epoch in range(start_epoch, last_epoch):
+        epoch_start = time.perf_counter()
         total, lr_used = train_one_epoch(
             model, raw_model, train_loader, sampler, generator, optimizer, scheduler,
             mesh, norm_device, weights, device, use_amp, train, seed, epoch, world,
@@ -193,6 +254,7 @@ def run(config, smoke_test):
         val_metrics = None
         improved = False
         if (epoch + 1) % evaluation["val_every_epochs"] == 0 or epoch + 1 == last_epoch:
+            logger.info("Epoch %03d/%03d | VAL evaluation started", epoch + 1, train["epochs"])
             # Uneven evaluation partitions use the raw model to avoid DDP collectives.
             val_metrics, val_runtime = evaluate(
                 raw_model, eval_loaders["val"], mesh, norm_device, weights, device,
@@ -220,20 +282,25 @@ def run(config, smoke_test):
             row = training_metrics(epoch, lr_used, total, val_metrics, smoke_test)
             with (output_dir / "training_metrics.jsonl").open("a") as stream:
                 stream.write(json.dumps(row, allow_nan=False) + "\n")
-            print(json.dumps(row), flush=True)
+            log_epoch(row, train["epochs"], time.perf_counter() - epoch_start)
         if world > 1:
             dist.barrier()
 
+    training_seconds = time.perf_counter() - training_start
+
     # Reload the selected checkpoint and verify VAL before using it for final TEST.
+    logger.info("Reloading selected checkpoint: %s", output_dir / "best_overall.pt")
     selected = load_selected_checkpoint(output_dir, raw_model)
     reloaded_val, _ = evaluate(
         raw_model, eval_loaders["val"], mesh, norm_device, weights, device, use_amp
     )
     verify_reload_metrics(reloaded_val, selected)
     runtime["checkpoint_reload_succeeded"] = True
+    logger.info("Selected checkpoint VAL metrics verified after reload")
 
     test_metrics = None
     if evaluation["test_at_end"] and "test" in eval_loaders:
+        logger.info("Final TEST evaluation started")
         test_metrics, runtime["test"] = evaluate(
             raw_model, eval_loaders["test"], mesh, norm_device, weights, device, use_amp
         )
@@ -263,8 +330,7 @@ def run(config, smoke_test):
         (output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, allow_nan=False)
         )
-        print(f"Results: {output_dir}", flush=True)
-        print(json.dumps({k: v for k, v in summary.items() if k != "runtime"}), flush=True)
+        log_final(summary, output_dir, time.perf_counter() - wall_start, training_seconds)
     cleanup_runtime()
 
 
@@ -278,7 +344,16 @@ def main():
         help="Full TRAIN statistics, four real training batches, limited VAL/TEST",
     )
     args = parser.parse_args()
-    run(load_config(args.config), args.smoke_test)
+    rank = int(os.environ.get("RANK", 0))
+    configure_logging(rank=rank)
+    try:
+        run(load_config(args.config), args.smoke_test)
+    except Exception:
+        # Keep the traceback in the active log and preserve the failing exit status.
+        logger.exception("Training failed on rank %d", rank)
+        raise
+    finally:
+        close_logging()
 
 
 if __name__ == "__main__":
